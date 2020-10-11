@@ -59,6 +59,20 @@ If you experience freezing, decrease this.  If you experience stuttering, increa
     (setq exp (cadr exp)))
   exp)
 
+(defun ae/enlist (exp)
+  "Return EXP wrapped in a list, or as-is if already a list."
+  (declare (pure t) (side-effect-free t))
+  (if (listp exp) exp (list exp)))
+
+(defun ae/visible-buffers (&optional buffer-list)
+  "Return a list of visible buffers (i.e. not buried).
+Optionally supply BUFFER-LIST to select visible buffers from this list."
+  (let ((buffers (delete-dups (mapcar #'window-buffer (window-list)))))
+    (if buffer-list
+        (cl-delete-if (lambda (b) (memq b buffer-list))
+                      buffers)
+      (delete-dups buffers))))
+
 (defmacro ae/hook! (hook &rest body)
   "Shorten declaration of HOOK by adding BODY to it."
   (declare (indent 1) (debug t))
@@ -111,7 +125,7 @@ DOCSTRING and BODY are as in `defun'.
     (setq docstring nil))
   (let (where-alist)
     (while (keywordp (car body))
-      (push `(cons ,(pop body) (doom-enlist ,(pop body)))
+      (push `(cons ,(pop body) (ae/enlist ,(pop body)))
             where-alist))
     `(progn
        (defun ,symbol ,arglist ,docstring ,@body)
@@ -143,6 +157,38 @@ Accepts the same rest arguments ARGS as `message'."
         ,(concat (propertize "EMD " 'face 'font-lock-comment-face)
                  format-string)
         ,@args))))
+
+(defun ae/load-envvars-file (file &optional noerror)
+  "Read and set envvars from FILE.
+If NOERROR is non-nil, don't throw an error if the file doesn't exist or is
+unreadable.  Returns the names of envvars that were changed."
+  (if (null (file-exists-p file))
+      (unless noerror
+        (signal 'file-error (list "No envvar file exists" file)))
+    (when-let
+        (env
+         (with-temp-buffer
+           (save-excursion
+             (setq-local coding-system-for-read 'utf-8)
+             (insert "\0\n") ; to prevent off-by-one
+             (insert-file-contents file))
+           (save-match-data
+             (when (re-search-forward "\0\n *\\([^#= \n]*\\)=" nil t)
+               (setq
+                env (split-string (buffer-substring (match-beginning 1) (point-max))
+                                  "\0\n"
+                                  'omit-nulls))))))
+      (setq-default
+       process-environment
+       (append (nreverse env)
+               (default-value 'process-environment))
+       exec-path
+       (append (split-string (getenv "PATH") path-separator t)
+               (list exec-directory))
+       shell-file-name
+       (or (getenv "SHELL")
+           (default-value 'shell-file-name)))
+      env)))
 
 ;;
 ;;; Global Variables
@@ -192,6 +238,32 @@ users).")
 ;;       (list ae/local-dir
 ;;             ae/etc-dir
 ;;             ae/cache-dir))
+
+(defvar indent-sensitive-modes '(python-mode
+                                 slim-mode
+                                 haskell-mode
+                                 purescript-mode)
+  "A group of modes that are sensitive to indentation.")
+
+(defvar progish-modes '(prog-mode
+                        css-mode)
+  "A group of modes that are for programming.")
+
+(defvar lispy-modes '(lisp-mode
+                      lisp-interaction-mode
+                      emacs-lisp-mode
+                      ielm-mode
+                      scheme-mode
+                      racket-mode
+                      clojure-mode
+                      eval-expression-minibuffer-setup)
+  "A group of modes that are LISP.")
+
+(defvar writing-modes '(org-mode
+                        text-mode
+                        message-mode
+                        markdown-mode)
+  "A group of modes that are for writing.")
 
 ;;
 ;;; Emacs core configuration
@@ -329,6 +401,9 @@ If RETURN-P, return the message as a string instead of displaying it."
 
 (add-hook 'window-setup-hook #'ae/display-benchmark-h 'append)
 
+;; Load environment.
+(ae/load-envvars-file ae/env-file 'noerror)
+
 ;;
 ;;;; Package Management
 ;;;;
@@ -350,8 +425,7 @@ If RETURN-P, return the message as a string instead of displaying it."
 (advice-add #'package--ensure-init-file :override #'ignore)
 
 ;; Refresh package.el the first time you call `package-install', so it can still
-;; be used (e.g. to temporarily test packages). Remember to run 'doom sync' to
-;; purge them; they can conflict with packages installed via straight!
+;; be used (e.g. to temporarily test packages).
 (add-transient-hook! 'package-install (package-refresh-contents))
 
 (setq straight-base-dir ae/local-dir
@@ -363,7 +437,7 @@ If RETURN-P, return the message as a string instead of displaying it."
       straight-check-for-modifications nil
       ;; We handle package.el ourselves (and a little more comprehensively)
       straight-enable-package-integration nil
-      ;; Before switching to straight, `doom-local-dir' would average out at
+      ;; Before switching to straight, `ae/local-dir' would average out at
       ;; around 100mb with half Doom's modules at ~230 packages. Afterwards, at
       ;; around 1gb. With shallow cloning, that is reduced to ~400mb. This has
       ;; no affect on packages that are pinned, however (run 'doom purge' to
@@ -378,7 +452,7 @@ If RETURN-P, return the message as a string instead of displaying it."
 
 (defvar bootstrap-version)
 (let ((bootstrap-file
-         (expand-file-name "straight/repos/straight.el/bootstrap.el" user-emacs-directory))
+       (expand-file-name "straight/repos/straight.el/bootstrap.el" straight-base-dir))
         (bootstrap-version 5))
     (unless (file-exists-p bootstrap-file)
       (with-current-buffer
@@ -464,14 +538,6 @@ If RETURN-P, return the message as a string instead of displaying it."
 ;; Remove hscroll-margin in shells, otherwise it causes jumpiness
 (ae/hook-modes! '(eshell-mode-hook term-mode-hook)
   (setq hscroll-margin 0))
-
-;;
-;;; Fringes
-
-;; Reduce the clutter in the fringes; we'd like to reserve that space for more
-;; useful information, like git-gutter and flycheck.
-(setq indicate-buffer-boundaries nil
-      indicate-empty-lines nil)
 
 ;;
 ;;; Cursor
@@ -678,32 +744,121 @@ If RETURN-P, return the message as a string instead of displaying it."
 ;; non-X systems (like Windows or macOS), where only `STRING' is used.
 (setq x-select-request-type '(UTF8_STRING COMPOUND_TEXT TEXT STRING))
 
-;; When popping a yank with M-y select what to pop.
-(defun ae/yank-pop (&optional arg)
- "Call `yank-pop' with ARG when appropriate, or offer completion."
- (interactive "*P")
- (if arg (yank-pop arg)
-   (let* ((old-last-command last-command)
-          (selectrum-should-sort-p nil)
-          (enable-recursive-minibuffers t)
-          (text (completing-read
-                 "Yank: "
-                 (cl-remove-duplicates
-                  kill-ring :test #'string= :from-end t)
-                 nil t nil nil))
-          ;; Find `text' in `kill-ring'.
-          (pos (cl-position text kill-ring :test #'string=))
-          ;; Translate relative to `kill-ring-yank-pointer'.
-          (n (+ pos (length kill-ring-yank-pointer))))
-     (unless (string= text (current-kill n t))
-       (error "Could not setup for `current-kill'"))
-     ;; Restore `last-command' over Selectrum commands.
-     (setq last-command old-last-command)
-     ;; Delegate to `yank-pop' if appropriate or just insert.
-     (if (eq last-command 'yank)
-         (yank-pop n) (insert-for-yank text)))))
+;;
+;;;; Fine tune builtin functionality.
 
-(global-set-key [remap yank-pop] #'ae/yank-pop)
+(use-package autorevert
+  ;; revert buffers when their files/state have changed
+  :hook (focus-in . +autorevert-auto-revert-buffers-h)
+  :hook (after-save . +autorevert-auto-revert-buffers-h)
+  ;; :hook (doom-switch-buffer . +autorevert-auto-revert-buffer-h)
+  ;; :hook (doom-switch-window . +autorevert-auto-revert-buffer-h)
+  :config
+  (setq auto-revert-verbose t ; let us know when it happens
+        auto-revert-use-notify nil
+        auto-revert-stop-on-user-input nil
+        ;; Only prompts for confirmation when buffer is unsaved.
+        revert-without-query (list "."))
+
+  ;; `auto-revert-mode' and `global-auto-revert-mode' would, normally, abuse the
+  ;; heck out of inotify handles _or_ aggresively poll your buffer list every X
+  ;; seconds. Too many inotify handles can grind Emacs to a halt if you preform
+  ;; expensive or batch processes on files outside of Emacs (e.g. their mtime
+  ;; changes), and polling your buffer list is terribly inefficient as your
+  ;; buffer list grows into the tens or hundreds.
+  ;;
+  ;; So Doom uses a different strategy: we lazily auto revert buffers when the
+  ;; user a) saves a file, b) switches to a buffer (or its window), or c) you
+  ;; focus Emacs (after using another program). This way, Emacs only ever has to
+  ;; operate on, at minimum, a single buffer and, at maximum, X buffers, where X
+  ;; is the number of open windows (which is rarely, if ever, over 10).
+  (defun +autorevert-auto-revert-buffer-h ()
+    "Auto revert current buffer, if necessary."
+    (unless (or auto-revert-mode (active-minibuffer-window))
+      (let ((auto-revert-mode t))
+        (auto-revert-handler))))
+
+  (defun +autorevert-auto-revert-buffers-h ()
+    "Auto revert stale buffers in visible windows, if necessary."
+    (dolist (buf (ae/visible-buffers))
+      (with-current-buffer buf
+        (+autorevert-auto-revert-buffer-h)))))
+
+(use-package recentf
+  :hook ((after-init . recentf-mode)
+	 (kill-emacs-hook . recentf-cleanup))
+  :commands recentf-open-files
+  :config
+  (defun +recentf-recent-file-truename (file)
+    (if (or (file-remote-p file nil t)
+            (not (file-remote-p file)))
+        (file-truename file)
+      file))
+
+  (setq recentf-filename-handlers
+        '(;; Text properties inflate the size of recentf's files, and there is
+          ;; no purpose in persisting them, so we strip them out.
+          substring-no-properties
+          ;; Resolve symlinks of local files. Otherwise we get duplicate
+          ;; entries opening symlinks.
+          +recentf-recent-file-truename
+          ;; Replace $HOME with ~, which is more portable, and reduces how much
+          ;; horizontal space the recentf listing uses to list recent files.
+          abbreviate-file-name)
+        recentf-save-file (concat ae/cache-dir "recentf")
+        recentf-auto-cleanup 'never
+        recentf-max-menu-items 0
+        recentf-max-saved-items 200)
+
+  (ae/hook! 'dired-mode-hook
+    (recentf-add-file default-directory)))
+
+(use-package saveplace
+  ;; persistent point location in buffers
+  :hook (after-init . save-place-mode)
+  :init
+  (setq save-place-file (concat ae/cache-dir "saveplace")
+        save-place-limit 100)
+  :config
+  (defadvice! +saveplace-recenter-on-load-saveplace-a (&rest _)
+    "Recenter on cursor when loading a saved place."
+    :after-while #'save-place-find-file-hook
+    (if buffer-file-name (ignore-errors (recenter))))
+
+  ;; (defadvice! doom--inhibit-saveplace-in-long-files-a (orig-fn &rest args)
+  ;;   :around #'save-place-to-alist
+  ;;   ;; (unless doom-large-file-p
+  ;;   ;;   (apply orig-fn args))
+  ;;   (apply orig-fn args))
+
+  ;; (defadvice! doom--dont-prettify-saveplace-cache-a (orig-fn)
+;;     "`save-place-alist-to-file' uses `pp' to prettify the contents of its cache.
+;; `pp' can be expensive for longer lists, and there's no reason to prettify cache
+;; files, so we replace calls to `pp' with the much faster `prin1'."
+;;     :around #'save-place-alist-to-file
+;;     (letf! ((#'pp #'prin1)) (funcall orig-fn)))
+  )
+
+(use-package server
+  :when (display-graphic-p)
+  ;; :after-call pre-command-hook after-find-file focus-out-hook
+  :defer 1
+  :init
+  (when-let (name (getenv "EMACS_SERVER_NAME"))
+    (setq server-name name))
+  :config
+  (unless (server-running-p)
+    (server-start)))
+
+;;
+;;;; Easily jump back to previous locations.
+(use-package better-jumper
+  :straight t
+  :blackout t
+  :hook (after-init . better-jumper-mode)
+  :hook (better-jumper-post-jump . recenter)
+  :init
+  (global-set-key [remap xref-pop-marker-stack] #'better-jumper-jump-backward))
 
 ;;; Make window splitting bit more useful,
 (defun ae/vsplit-same-buffer ()
@@ -739,31 +894,107 @@ If RETURN-P, return the message as a string instead of displaying it."
  ("C-x 2" . ae/vsplit-last-buffer)
  ("C-x 3" . ae/hsplit-last-buffer))
 
-;; I use Selectrum over Ido, Ivy or Helm for incremental narrowing. I
-;; combine it with prescient for better sorting and filtering.
-(use-package selectrum
+;;
+;;;; Ivy for completions
+
+(use-package ivy
   :straight t
+  :blackout t
+  :hook (after-init . ivy-mode)
+  :init
+  (let ((standard-search-fn
+         #'+ivy-prescient-non-fuzzy)
+        (alt-search-fn
+         #'ivy--regex-fuzzy))
+    (setq ivy-re-builders-alist
+          `((counsel-rg     . ,standard-search-fn)
+            (swiper         . ,standard-search-fn)
+            (swiper-isearch . ,standard-search-fn)
+            (t . ,alt-search-fn))
+          ivy-more-chars-alist
+          '((counsel-rg . 1)
+            (counsel-search . 2)
+            (t . 3))))
   :config
-  (selectrum-mode +1))
+  ;; The default sorter is much to slow and the default for `ivy-sort-max-size'
+  ;; is way too big (30,000). Turn it down so big repos affect project
+  ;; navigation less.
+  (setq ivy-sort-max-size 7500)
+
+  ;; Counsel changes a lot of ivy's state at startup; to control for that, we
+  ;; need to load it as early as possible. Some packages (like `ivy-prescient')
+  ;; require this.
+  (require 'counsel nil t)
+
+  (setq ivy-height 17
+        ivy-wrap t
+        ivy-fixed-height-minibuffer t
+        ;; disable magic slash on non-match
+        ivy-magic-slash-non-match-action nil
+        ;; don't show recent files in switch-buffer
+        ivy-use-virtual-buffers nil
+        ;; ...but if that ever changes, show their full path
+        ivy-virtual-abbreviate 'full
+        ;; don't quit minibuffer on delete-error
+        ivy-on-del-error-function #'ignore
+        ;; enable ability to select prompt (alternative to `ivy-immediate-done')
+        ivy-use-selectable-prompt t))
+
+(use-package counsel
+  :straight t
+  :blackout t
+  :after (ivy)
+  :hook (ivy-mode . counsel-mode)
+  :config
+  ;; Integrate with `helpful'
+  (setq counsel-describe-function-function #'helpful-callable
+        counsel-describe-variable-function #'helpful-variable)
+
+  ;; Record in jumplist when opening files via counsel-{ag,rg,pt,git-grep}
+  (add-hook 'counsel-grep-post-action-hook #'better-jumper-set-jump)
+  (add-hook 'counsel-grep-post-action-hook #'recenter)
+
+  ;; `counsel-locate'
+  (when *is-mac*
+    ;; Use spotlight on mac by default since it doesn't need any additional setup
+    (setq counsel-locate-cmd #'counsel-locate-cmd-mdfind)))
 
 (use-package prescient
   :straight t)
 
-(use-package selectrum-prescient
+(use-package ivy-prescient
   :straight t
-  :after (selectrum prescient)
+  :after (prescient ivy)
+  :hook (ivy-mode . ivy-prescient-mode)
+  :hook (ivy-prescient-mode . prescient-persist-mode)
+  :init
+  (setq prescient-filter-method '(literal regexp initialism fuzzy))
   :config
-  (selectrum-prescient-mode +1)
-  (prescient-persist-mode +1))
+  (setq ivy-prescient-retain-classic-highlighting t)
+  
+  (defun +ivy-prescient-non-fuzzy (str)
+    (let ((prescient-filter-method '(literal regexp)))
+      (ivy-prescient-re-builder str)))
+
+  ;; NOTE prescient config duplicated with `company'
+  (setq prescient-save-file (concat ae/cache-dir "prescient-save.el")))
+
+(use-package wgrep
+  :straight t
+  :commands wgrep-change-to-wgrep-mode
+  :config
+  (setq wgrep-auto-save-buffer t))
+
+;; (use-package ivy-rich
+;;   :straight t)
 
 ;; Use amx over the builtin M-x.
 (use-package amx
   :straight t
   :hook (after-init . amx-mode)
-  :after (selectrum)
+  :after (ivy)
   :config
-  (setq amx-backend 'selectrum
-	amx-save-file (concat ae/cache-dir "amx-items")))
+  (setq amx-save-file (concat ae/cache-dir "amx-items")))
 
 ;; a better *help* buffer
 (use-package helpful
@@ -802,32 +1033,50 @@ If RETURN-P, return the message as a string instead of displaying it."
 (ae/hook! 'imenu-after-jump-hook
   (recenter))
 
-(defvar indent-sensitive-modes '(python-mode
-                                 slim-mode
-                                 haskell-mode
-                                 purescript-mode)
-  "A group of modes that are sensitive to indentation.")
+;;
+;;;; Undo/Redo
+(use-package undo-fu
+  :straight t
+  ;; :bind (("C-/" . undo-fu-only-undo)
+  ;; 	 ("C-S-/" . undo-fu-only-redo))
+  :config
+  ;; Store more undo history to prevent loss of data
+  (setq undo-limit 400000
+        undo-strong-limit 3000000
+        undo-outer-limit 3000000)
 
-(defvar progish-modes '(prog-mode
-                        css-mode)
-  "A group of modes that are for programming.")
+  (define-minor-mode undo-fu-mode
+    "Enables `undo-fu' for the current session."
+    :keymap (let ((map (make-sparse-keymap)))
+              (define-key map [remap undo] #'undo-fu-only-undo)
+              (define-key map [remap redo] #'undo-fu-only-redo)
+              (define-key map (kbd "C-_")     #'undo-fu-only-undo)
+              (define-key map (kbd "M-_")     #'undo-fu-only-redo)
+              (define-key map (kbd "C-M-_")   #'undo-fu-only-redo-all)
+              (define-key map (kbd "C-x r u") #'undo-fu-session-save)
+              (define-key map (kbd "C-x r U") #'undo-fu-session-recover)
+              map)
+    :init-value nil
+    :global t))
 
-(defvar lispy-modes '(lisp-mode
-                      lisp-interaction-mode
-                      emacs-lisp-mode
-                      ielm-mode
-                      scheme-mode
-                      racket-mode
-                      clojure-mode
-                      eval-expression-minibuffer-setup)
-  "A group of modes that are LISP.")
+(use-package undo-fu-session
+  :straight t
+  :after (undo-fu)
+  :preface
+  (setq undo-fu-session-directory (concat ae/cache-dir "undo-fu-session/")
+        undo-fu-session-incompatible-files '("\\.gpg$" "/COMMIT_EDITMSG\\'" "/git-rebase-todo\\'"))
+  :hook (undo-fu . global-undo-fu-session-mode)
+  :config
+  ;; HACK Use the faster zstd to compress undo files instead of gzip
+  (when (executable-find "zstd")
+    (defadvice! +undo-fu-session-use-zstd-a (filename)
+      :filter-return #'undo-fu-session--make-file-name
+      (if undo-fu-session-compression
+          (concat (file-name-sans-extension filename) ".zst")
+        filename))))
 
-(defvar writing-modes '(org-mode
-                        text-mode
-                        message-mode
-                        markdown-mode)
-  "A group of modes that are for writing.")
-
+;;
+;;;; Structural editing
 (use-package smartparens
   :straight t
   :hook (after-init . smartparens-global-mode)
@@ -957,6 +1206,7 @@ If RETURN-P, return the message as a string instead of displaying it."
 ;; a less intrusive `delete-trailing-whitespaces' on save
 (use-package ws-butler
   :straight (:host github :repo "hlissner/ws-butler")
+  :blackout t
   :hook (after-init . ws-butler-global-mode))
 
 ;; Select windows without the use of the mouse or spatial navigation.
@@ -1125,9 +1375,23 @@ Examples:
 (defvar ae/projectile-cache-blacklist '("~" "/tmp" "/")
   "Directories that should never be cached.")
 
+;;;###autoload
+(defun doom-project-p (&optional dir)
+  "Return t if DIR (defaults to `default-directory') is a valid project."
+  (and (doom-project-root dir)
+       t))
+
+  ;;;###autoload
+(defun doom-project-root (&optional dir)
+  "Return the project root of DIR (defaults to `default-directory').
+Returns nil if not in a project."
+  (let ((projectile-project-root (unless dir projectile-project-root))
+        projectile-require-project-root)
+    (projectile-project-root dir)))
+
 (use-package projectile
   :straight t
-  :after (selectrum)
+  :after (ivy)
   :commands (projectile-project-root
              projectile-project-name
              projectile-project-p
@@ -1144,7 +1408,7 @@ Examples:
         projectile-kill-buffers-filter 'kill-only-files
         projectile-known-projects-file (concat ae/cache-dir "projectile.projects")
         projectile-ignored-projects '("~/" "/tmp")
-	projectile-completion-system 'default)
+	projectile-completion-system 'ivy)
   :config
   (add-transient-hook! 'projectile-relevant-known-projects
     (projectile-cleanup-known-projects)
@@ -1194,6 +1458,109 @@ Examples:
            " Proj"
          (format " Proj[%s]" (projectile-project-name)))))))
 
+;;;###autoload
+(defun +ivy/projectile-find-file ()
+  "A more sensible `counsel-projectile-find-file'.
+It will revert to `counsel-find-file' if invoked from $HOME or /,
+`counsel-file-jump' if invoked from a non-project,
+`projectile-find-file' if in a big project (more than
+`ivy-sort-max-size' files), or `counsel-projectile-find-file'
+otherwise.  The point of this is to avoid Emacs locking up
+indexing massive file trees."
+  (interactive)
+  ;; Spoof the command so that ivy/counsel will display the (well fleshed-out)
+  ;; actions list for `counsel-find-file' on C-o. The actions list for the other
+  ;; commands aren't as well configured or are empty.
+  (let ((this-command 'counsel-find-file))
+    (call-interactively
+     (cond ((or (file-equal-p default-directory "~")
+                (file-equal-p default-directory "/")
+                (when-let (proot (doom-project-root))
+                  (file-equal-p proot "~")))
+            #'counsel-find-file)
+
+           ((doom-project-p)
+            (let ((files (projectile-current-project-files)))
+              (if (<= (length files) ivy-sort-max-size)
+                  #'counsel-projectile-find-file
+                #'projectile-find-file)))
+
+           (#'counsel-file-jump)))))
+
+;;;###autoload
+(cl-defun +ivy-file-search (&key query in all-files (recursive t) prompt args)
+  "Conduct a file search using ripgrep.
+:query STRING
+  Determines the initial input to search for.
+:in PATH
+  Sets what directory to base the search out of.  Defaults to the current
+  project's root.
+:recursive BOOL
+  Whether or not to search files recursively from the base directory."
+  (declare (indent defun))
+  (unless (executable-find "rg")
+    (user-error "Couldn't find ripgrep in your PATH"))
+  (require 'counsel)
+  (let* ((this-command 'counsel-rg)
+         (project-root (or (doom-project-root) default-directory))
+         (directory (or in project-root))
+         (args (concat (if all-files " -uu")
+                       (unless recursive " --maxdepth 1")
+                       " " (mapconcat #'shell-quote-argument args " "))))
+    (setq deactivate-mark t)
+    (counsel-rg
+     (or query
+         (when (doom-region-active-p)
+           (replace-regexp-in-string
+            "[! |]" (lambda (substr)
+                      (cond ((and (string= substr " ")
+                                  (not (featurep! +fuzzy)))
+                             "  ")
+                            ((string= substr "|")
+                             "\\\\\\\\|")
+                            ((concat "\\\\" substr))))
+            (rxt-quote-pcre (doom-thing-at-point-or-region)))))
+     directory args
+     (or prompt
+         (format "rg%s [%s]: "
+                 args
+                 (cond ((equal directory default-directory)
+                        "./")
+                       ((equal directory project-root)
+                        (projectile-project-name))
+                       ((file-relative-name directory project-root))))))))
+
+;;;###autoload
+(defun +ivy/project-search (&optional arg initial-query directory)
+  "Performs a live project search from the project root using ripgrep.
+If ARG (universal argument), include all files, even hidden or compressed ones,
+in the search."
+  (interactive "P")
+  (+ivy-file-search :query initial-query :in directory :all-files arg))
+
+;;;###autoload
+(defun +ivy/project-search-from-cwd (&optional arg initial-query)
+  "Performs a project search recursively from the current directory.
+If ARG (universal argument), include all files, even hidden or compressed ones."
+  (interactive "P")
+  (+ivy/project-search arg initial-query default-directory))
+
+(use-package counsel-projectile
+  :straight t
+  :blackout t
+  :after (ivy counsel projectile)
+  :bind (([remap projectile-find-dir] . counsel-projectile-find-dir)
+	 ([remap projectile-switch-to-buffer] . counsel-projectile-switch-to-buffer)
+	 ([remap projectile-grep] . counsel-projectile-grep)
+	 ([remap projectile-ag] . counsel-projectile-ag)
+	 ([remap projectile-switch-project] . counsel-projectile-switch-project))
+  :config
+  ;; no highlighting visited files; slows down the filtering
+  (ivy-set-display-transformer #'counsel-projectile-find-file nil)
+  
+  ;; Using with prescient.
+  (setq counsel-projectile-sort-files t))
+
 ;;
 ;;;; Programming
 ;;;;
@@ -1202,6 +1569,76 @@ Examples:
   :straight t
   :commands (highlight-quoted-mode)
   :hook (emacs-lisp-mode . highlight-quoted-mode))
+
+;;
+;;;; Git in the fringe.
+(defun +vc-gutter-init-maybe-h ()
+  "Enable `git-gutter-mode' in the current buffer.
+If the buffer doesn't represent an existing file, `git-gutter-mode's activation
+is deferred until the file is saved.  Respects `git-gutter:disabled-modes'."
+  (let ((file-name (buffer-file-name (buffer-base-buffer))))
+    (when (not (file-remote-p (or file-name default-directory)))
+      (if (null file-name)
+          (add-hook 'after-save-hook #'+vc-gutter-init-maybe-h nil 'local)
+        (when (and (vc-backend file-name)
+                   (progn
+                     (require 'git-gutter)
+                     (not (memq major-mode git-gutter:disabled-modes))))
+          (if (and (display-graphic-p)
+                   (require 'git-gutter-fringe nil t))
+              (setq-local git-gutter:init-function      #'git-gutter-fr:init
+                          git-gutter:view-diff-function #'git-gutter-fr:view-diff-infos
+                          git-gutter:clear-function     #'git-gutter-fr:clear
+                          git-gutter:window-width -1)
+            (setq-local git-gutter:init-function      'nil
+                        git-gutter:view-diff-function #'git-gutter:view-diff-infos
+                        git-gutter:clear-function     #'git-gutter:clear-diff-infos
+                        git-gutter:window-width 1))
+          (git-gutter-mode +1)
+          (remove-hook 'after-save-hook #'+vc-gutter-init-maybe-h 'local))))))
+
+(use-package git-gutter
+  :straight t
+  :blackout t
+  :after (flycheck)
+  :hook ((find-file . +vc-gutter-init-maybe-h)
+	 (focus-in . git-gutter:update-all-windows))
+  :init
+  ;; Disable in Org mode, as per syl20bnr/spacemacs#10555 and
+  ;; syohex/emacs-git-gutter#24. Apparently, the mode-enabling function for
+  ;; global minor modes gets called for new buffers while they are still in
+  ;; `fundamental-mode', before a major mode has been assigned. I don't know why
+  ;; this is the case, but adding `fundamental-mode' here fixes the issue.
+  (setq git-gutter:disabled-modes '(fundamental-mode image-mode pdf-view-mode))
+
+  ;; Only enable the backends that are available, so it doesn't have to check
+  ;; when opening each buffer.
+  (setq git-gutter:handled-backends
+        (cons 'git (cl-remove-if-not #'executable-find (list 'hg 'svn 'bzr)
+                                     :key #'symbol-name)))
+
+  ;; update git-gutter when using magit commands
+  (advice-add #'magit-stage-file   :after #'+vc-gutter-update-h)
+  (advice-add #'magit-unstage-file :after #'+vc-gutter-update-h)
+  
+  ; standardize default fringe width
+  (if (fboundp 'fringe-mode) (fringe-mode '4))
+
+  ;; places the git gutter outside the margins.
+  (setq-default fringes-outside-margins t)
+  ;; thin fringe bitmaps
+  (define-fringe-bitmap 'git-gutter-fr:added [224]
+    nil nil '(center repeated))
+  (define-fringe-bitmap 'git-gutter-fr:modified [224]
+    nil nil '(center repeated))
+  (define-fringe-bitmap 'git-gutter-fr:deleted [128 192 224 240]
+    nil nil 'bottom)
+
+  ;; let diff have left fringe, flycheck can have right fringe
+  (setq flycheck-indication-mode 'right-fringe)
+  ;; A non-descript, left-pointing arrow
+  (define-fringe-bitmap 'flycheck-fringe-bitmap-double-arrow
+    [16 48 112 240 112 48 16] nil nil 'center))
 
 ;;
 ;;;; Formatting code buffers
@@ -1222,16 +1659,16 @@ Examples:
 ;;
 ;;;; Lookup things
 
-(use-package dumb-jump
-  :straight t
-  :hook (dumb-jump-after-jump . better-jumper-set-jump)
-  :commands dumb-jump-result-follow
-  :config
-  (setq dumb-jump-default-project ae/emacs-dir
-        dumb-jump-prefer-searcher 'rg
-        dumb-jump-aggressive nil
-        ;; dumb-jump-selector ('popup)
-	))
+;; (use-package dumb-jump
+;;   :straight t
+;;   :hook (dumb-jump-after-jump . better-jumper-set-jump)
+;;   :commands dumb-jump-result-follow
+;;   :config
+;;   (setq dumb-jump-default-project ae/emacs-dir
+;;         dumb-jump-prefer-searcher 'rg
+;;         dumb-jump-aggressive nil
+;;         ;; dumb-jump-selector ('popup)
+;; 	))
 
 ;;
 ;;;; Language Server Protocol
@@ -1268,7 +1705,9 @@ Examples:
    lsp-enable-text-document-color nil
    ;; Disable features that modify our code without our permission.
    lsp-enable-indentation nil
-   lsp-enable-on-type-formatting nil))
+   lsp-enable-on-type-formatting nil
+   ;; Disable Eslint server integration
+   lsp-eslint-server-command nil))
 
 (use-package lsp-ui
   :straight t
@@ -1286,6 +1725,41 @@ Examples:
    ;; errors flash briefly and then disappear).
    lsp-ui-sideline-show-hover nil))
 
+;; Web
+(use-package emmet-mode
+  :straight t
+  :blackout t
+  :preface (defvar emmet-mode-keymap (make-sparse-keymap))
+  :hook (css-mode web-mode html-mode rjsx-mode)
+  :custom
+  (emmet-expand-jsx-className? t)
+  :config
+  (setq emmet-move-cursor-between-quotes t)
+  (when (require 'yasnippet nil t)
+    (add-hook 'emmet-mode-hook #'yas-minor-mode-on)))
+
+(use-package web-mode
+  :straight t
+  :after (add-node-modules-path)
+  :config
+  (setq web-mode-markup-indent-offset 2
+        web-mode-css-indent-offset 2
+        web-mode-code-indent-offset 2
+        web-mode-block-padding 2
+        web-mode-comment-style 2
+
+        web-mode-enable-css-colorization t
+        web-mode-enable-auto-pairing t
+        web-mode-enable-comment-keywords t
+        web-mode-enable-current-element-highlight t)
+
+  (when (locate-dominating-file default-directory "package.json")
+    (add-node-modules-path)))
+
+(use-package company-web
+  :straight t
+  :after (company))
+
 ;; Rust
 (use-package rustic
   :straight t
@@ -1295,6 +1769,170 @@ Examples:
   :config
   (setq rustic-lsp-client 'lsp-mode)
   (add-to-list 'flycheck-checkers 'rustic-clippy))
+
+;; Javascript/TypeScript
+(defun +javascript-auto-fix ()
+  "Fix linter errors automatically for this buffer."
+  (interactive)
+  (-when-let* ((file-name (buffer-file-name))
+               ;; Using the checker chaining, this returns javascript-flow
+               ;; (checker (flycheck-checker-executable
+               ;;           (ignore-errors (flycheck-get-checker-for-buffer))))
+               (checker (flycheck-find-checker-executable 'javascript-eslint))
+               (cmd (concat checker " --fix " file-name)))
+    (message cmd)
+    (shell-command cmd)
+    (revert-buffer t t t)))
+
+(defun +javascript-init-lsp-or-tide-maybe-h ()
+  "Start `lsp' or `tide' in the current buffer.
+LSP will be used if the +lsp flag is enabled for :lang javascript AND if the
+current buffer represents a file in a project.
+If LSP fails to start (e.g. no available server or project), then we fall back
+to tide."
+  (let ((buffer-file-name (buffer-file-name (buffer-base-buffer))))
+    (when (derived-mode-p 'js-mode 'typescript-mode 'typescript-tsx-mode)
+      (if (not buffer-file-name)
+          ;; necessary because `tide-setup' and `lsp' will error if not a
+          ;; file-visiting buffer
+          (add-hook 'after-save-hook #'+javascript-init-lsp-or-tide-maybe-h nil 'local)
+        (or (lsp-deferred)
+            ;; fall back to tide
+            (if (executable-find "node")
+                (and (require 'tide nil t)
+                     (progn (tide-setup) tide-mode))
+              (ignore
+               (ae/log "Couldn't start tide because 'node' is missing"))))
+        (remove-hook 'after-save-hook #'+javascript-init-lsp-or-tide-maybe-h 'local)))))
+
+(use-package add-node-modules-path
+  :straight t
+  :config
+  (setq add-node-modules-path-debug t))
+
+(use-package js2-mode
+  :straight t
+  ;; add-node-modules-path has to be placed before flycheck
+  :after (add-node-modules-path flycheck company smartparens)
+  :mode "\\.m?js\\'"
+  :interpreter "node"
+  :commands js2-line-break
+  :hook ((js2-mode . add-node-modules-path)
+	 (js2-mode . rainbow-delimiters-mode))
+  :bind (:map flycheck-mode-map
+	      ("C-c ! f" . +javascript-auto-fix))
+  :config
+  (require 'smartparens-javascript)
+
+  (flycheck-add-mode 'javascript-eslint 'js2-mode)
+
+  (setq mode-name "JS2"
+	js2-basic-offset 2
+	js-switch-indent-offset js2-basic-offset
+	js2-bounce-indent-p t
+	js-chain-indent t
+        ;; Don't mishighlight shebang lines
+        js2-skip-preprocessor-directives t
+        ;; let flycheck handle this
+        js2-mode-show-parse-errors nil
+        js2-mode-show-strict-warnings nil
+        ;; Flycheck provides these features, so disable them: conflicting with
+        ;; the eslint settings.
+        js2-strict-trailing-comma-warning nil
+        js2-strict-missing-semi-warning nil
+        ;; maximum fontification
+        js2-highlight-level 3
+        js2-highlight-external-variables t
+        js2-idle-timer-delay 0.1)
+
+  (when (locate-dominating-file default-directory "package.json")
+    (add-node-modules-path)))
+
+(use-package rjsx-mode
+  :straight t
+  ;; jshint doesn't know how to deal with jsx
+  :hook ((rjsx-mode . add-node-modules-path)
+	 (rjsx-mode . (lambda () (push 'javascript-jshint flycheck-disabled-checkers))))
+  :init
+  (add-node-modules-path)
+  (defun +javascript-jsx-file-p ()
+    "Detect React or preact imports early in the file."
+    (and buffer-file-name
+         (string= (file-name-extension buffer-file-name) "js")
+         (re-search-forward "\\(^\\s-*import +React\\|\\( from \\|require(\\)[\"']p?react\\)"
+                            magic-mode-regexp-match-limit t)
+         (progn (goto-char (match-beginning 1))
+                (not (sp-point-in-string-or-comment)))))
+  (add-to-list 'magic-mode-alist '(+javascript-jsx-file-p . rjsx-mode)))
+
+(use-package typescript-mode
+  :straight t
+  ;; add-node-modules-path has to be placed before flycheck
+  :after (add-node-modules-path flycheck web-mode)
+  :hook ((typescript-mode . add-node-modules-path)
+	 (typescript-mode . rainbow-delimiters-mode)
+	 (typescript-mode . +javascript-init-lsp-or-tide-maybe-h))
+  :custom
+  (comment-line-break-function #'js2-line-break)
+  :config
+
+  (when (locate-dominating-file default-directory "package.json")
+    (add-node-modules-path)))
+
+(progn
+  (define-derived-mode typescript-tsx-mode web-mode "TypeScript-tsx")
+  (add-to-list 'auto-mode-alist '("\\.tsx\\'" . typescript-tsx-mode))
+
+  (ae/hook! 'typescript-tsx-mode-hook
+    (when (locate-dominating-file default-directory "package.json")
+      (add-node-modules-path))
+    (emmet-mode)
+    (+javascript-init-lsp-or-tide-maybe-h)
+
+    (flycheck-add-mode 'typescript-tslint 'typescript-tsx-mode)
+    (flycheck-add-mode 'javascript-eslint 'typescript-tsx-mode)))
+
+(use-package tide
+  :straight t
+  :after (typescript-mode company flycheck)
+  :config
+  (setq tide-completion-detailed t
+        tide-always-show-documentation t
+        ;; Fix #1792: by default, tide ignores payloads larger than 100kb. This
+        ;; is too small for larger projects that produce long completion lists,
+        ;; so we up it to 512kb.
+        tide-server-max-response-length 524288)
+  
+  (setq-default company-backends (delq 'company-tide (default-value 'company-backends)))
+
+  ;; Eldoc is activated too soon and disables itself, thinking there is no eldoc
+  ;; support in the current buffer, so we must re-enable it later once eldoc
+  ;; support exists. It is set *after* tide-mode is enabled, so enabling it on
+  ;; `tide-mode-hook' is too early, so...
+  (advice-add #'tide-setup :after #'eldoc-mode))
+
+;; JSON
+(use-package json-mode
+  :ensure t
+  :defer t
+  :after (flycheck)
+  :mode (("\\.json\\(ld\\)?$" . json-mode) ;; otherwise the mode fails the first load
+         ("\\.eslintrc$" . json-mode)
+         ("\\.babelrc$" . json-mode)
+         ("\\.prettierrc$" . json-mode)
+         ("\\.huskyrc$" . json-mode)
+         ("\\.lintstagedrc$" . json-mode)
+         ("\\.commitlintrc$" . json-mode)
+         ("\\.stylelintrc$" . json-mode))
+  :config
+  (setq js-indent-level 2 ;; specifies the indentation for json-mode-beautify
+        json-reformat:indent-width 2
+        json-reformat:pretty-string? t)
+
+  (setq-default flycheck-disabled-checkers
+                (append flycheck-disabled-checkers '(json-python-json)))
+
+  (flycheck-select-checker 'json-jsonlint))
 
 (provide 'init)
 ;;; init.el ends here
