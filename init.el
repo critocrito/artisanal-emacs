@@ -733,6 +733,18 @@ If RETURN-P, return the message as a string instead of displaying it."
 ;;;; Editor
 ;;;;
 
+;; Don't autosave files or create lock/history/backup files. We don't want
+;; copies of potentially sensitive material floating around or polluting our
+;; filesystem. We rely on git and our own good fortune instead. Fingers crossed!
+(setq auto-save-default nil
+      create-lockfiles nil
+      make-backup-files nil
+      ;; But have a place to store them in case we do use them...
+      ;; auto-save-list-file-name (concat doom-cache-dir "autosave")
+      auto-save-list-file-prefix (concat ae/cache-dir "autosave/")
+      auto-save-file-name-transforms `((".*" ,auto-save-list-file-prefix t))
+      backup-directory-alist `((".*" . ,(concat ae/cache-dir "backup/"))))
+
 ;;
 ;;; Clipboard / kill-ring
 
@@ -812,6 +824,26 @@ If RETURN-P, return the message as a string instead of displaying it."
 
   (ae/hook! 'dired-mode-hook
     (recentf-add-file default-directory)))
+
+;; persist variables across sessions
+(use-package savehist
+  :hook (after-init . savehist-mode)
+  :init
+  (setq savehist-file (concat ae/cache-dir "savehist"))
+  :config
+  (setq savehist-save-minibuffer-history t
+        savehist-autosave-interval nil     ; save on kill only
+        savehist-additional-variables
+        '(kill-ring                        ; persist clipboard
+          mark-ring global-mark-ring       ; persist marks
+          search-ring regexp-search-ring)) ; persist searches
+
+  ;; Remove text properties from `kill-ring' for a smaller savehist file.
+  (ae/hook! 'savehist-save-hook
+    (setq kill-ring (cl-loop for item in kill-ring
+                             if (stringp item)
+                             collect (substring-no-properties item)
+                             else if item collect it))))
 
 (use-package saveplace
   ;; persistent point location in buffers
